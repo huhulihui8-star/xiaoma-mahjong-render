@@ -126,6 +126,96 @@ def win_types(hand,wild,melds=None,dragon_blocked=False):
 
 def best_win_rank(types): return 2 if any(t in SPECIAL_WINS for t in types) else (1 if types else 0)
 
+def suit_bucket(t):
+    if t<9:return "wan"
+    if t<18:return "tong"
+    if t<27:return "tiao"
+    return "honor"
+
+def tile_without_one(tiles,tile):
+    x=list(tiles)
+    if tile in x:x.remove(tile)
+    return x
+
+def has_one_number_suit(tiles,wild):
+    suits={suit_bucket(t) for t in tiles if t!=wild and t<27}
+    return len(suits)==1 and bool(suits)
+
+def is_seven_pairs(tiles,wild):
+    if len(tiles)!=14:return False
+    c=counts(t for t in tiles if t!=wild); wilds=sum(1 for t in tiles if t==wild); singles=sum(1 for v in c if v%2)
+    return singles<=wilds and (wilds-singles)%2==0
+
+def is_seven_honors(tiles,wild):
+    honors={t for t in tiles if t>=27 and t!=wild}
+    return len(honors)>=7
+
+def all_honors_or_dragons(tiles,wild):
+    return bool(tiles) and all(t>=27 or t==wild for t in tiles)
+
+def winning_wait_count(before,wild,melds):
+    wins=[]
+    for t in range(34):
+        if win_types(before+[t],wild,melds,dragon_blocked=False):wins.append(t)
+    return wins
+
+@dataclass
+class WinContext:
+    winner:int
+    win_method:str
+    winning_tile:int|None
+    discarder:int|None
+    before_win_hand:list
+    after_win_hand:list
+    melds:list
+    win_types:list
+    wild:int
+    is_dealer:bool=False
+    dealer_streak:int=0
+    wall_remaining:int=0
+    turn_index:int=0
+    first_discard_done:bool=False
+
+def score_dragon_patterns(ctx):
+    hand=list(ctx.after_win_hand); before=list(ctx.before_win_hand); melds=list(ctx.melds)
+    wild=ctx.wild; c=counts(hand); dragon_count=c[wild]
+    kong_count=sum(1 for m in melds if m.get('type')=='gang')
+    patterns=[]
+    def add(name,dragons,full=False):patterns.append({'name':name,'dragons':dragons,'full':full})
+    if "4面子1对子" in ctx.win_types:add("平胡",1)
+    if all_triplets(hand,wild,melds):add("大对对",1); add("对对碰",1)
+    if has_one_number_suit(hand,wild):add("混一色",1)
+    if thirteen_unconnected(hand,wild):add("十三不搭",1)
+    if is_seven_honors(hand,wild):add("七风齐",1)
+    if kong_count>=1 and dragon_count>=1:add("一杠一达",1)
+    if kong_count>=2 and dragon_count>=2:add("二杠二达",1)
+    if dragon_count==0:add("无龙",2)
+    if dragon_count==1:add("一龙",1)
+    if dragon_count==2:add("二龙",2)
+    if dragon_count==3:add("三龙",3)
+    if dragon_count>=4:add("四龙",100,ctx.win_method=="discard_win")
+    if has_one_number_suit(hand,wild) and dragon_count>0:add("有龙清一色",10)
+    if has_one_number_suit(hand,wild) and dragon_count==0:add("无龙清一色",100,ctx.win_method=="discard_win")
+    waits=winning_wait_count(before,wild,melds) if before else []
+    if len(waits)==1:
+        add("单吊，胡相同牌" if ctx.winning_tile==wild else "单吊，胡不同牌",10,ctx.win_method=="discard_win")
+    if ctx.is_dealer and not ctx.first_discard_done:add("天胡",10)
+    if (not ctx.is_dealer) and ctx.turn_index<=1 and ctx.win_method in ("self_draw","gang_draw"):add("地胡",10)
+    if ctx.win_method=="gang_draw":add("杠爆",10)
+    if ctx.win_method=="robbed_kong":add("拉杠胡",10)
+    if ctx.win_method in ("self_draw","gang_draw") and before:
+        can_win_any=all(win_types(before+[t],wild,melds,dragon_blocked=False) for t in range(34))
+        if can_win_any:add("龙抛龙" if ctx.winning_tile==wild else "抛龙",10)
+    if ctx.wall_remaining==0 and ctx.win_method in ("self_draw","gang_draw"):add("海底捞月",10)
+    if is_seven_pairs(hand,wild) and dragon_count==0:add("清七对",100,ctx.win_method=="discard_win")
+    if kong_count>=3:add("三杠",100,ctx.win_method=="discard_win")
+    if sum(1 for t in hand if t>=27)>=11:add("十一风",100,ctx.win_method=="discard_win")
+    if all_honors_or_dragons(hand,wild):add("全风向",100,ctx.win_method=="discard_win")
+    if not patterns:add("平胡",1)
+    max_dragons=max(p['dragons'] for p in patterns)
+    winners=[p for p in patterns if p['dragons']==max_dragons]
+    return {'dragons':max_dragons,'patterns':[p['name'] for p in winners],'full_payout':any(p['full'] for p in winners)}
+
 @dataclass
 class Player:
     name:str
@@ -145,6 +235,7 @@ class Room:
         self.room_id=rid; self.lock=threading.RLock(); self.players=[Player(DEFAULT_NAMES[i]) for i in range(4)]
         self.owner=None; self.phase='lobby'; self.wall=[]; self.dragon=0; self.dragon_indicator=None; self.current=0; self.dealer=0; self.dealer_streak=0; self.must_discard=False; self.turn_at=time.time(); self.log=[]; self.round_no=1
         self.last_discard=None; self.last_discarder=None; self.claim=None; self.circle_id=0
+        self.last_draw_tile=None; self.pending_gang_draw=False; self.last_draw_was_gang=False; self.turn_index=0; self.first_discard_done=False; self.lastWinSummary=None
         self.add_log('房间已创建。所有真人准备后，由房主开始游戏。')
     def add_log(self,x): self.log=(self.log+[x])[-100:]
     def humans(self): return [i for i,p in enumerate(self.players) if p.human]
@@ -189,7 +280,8 @@ class Room:
                 if not p.human:p.name=DEFAULT_NAMES[i]+'（电脑）'
             self.wall=list(range(34))*4; random.shuffle(self.wall)
             self.dragon_indicator=self.wall.pop(); self.dragon=next_dragon(self.dragon_indicator); self.current=self.dealer
-            self.last_discard=None; self.last_discarder=None; self.claim=None; self.circle_id+=1
+            self.last_discard=None; self.last_discarder=None; self.claim=None; self.circle_id+=1; self.lastWinSummary=None
+            self.last_draw_tile=None; self.pending_gang_draw=False; self.last_draw_was_gang=False; self.turn_index=0; self.first_discard_done=False
             for _ in range(13):
                 for p in self.players:p.hand.append(self.wall.pop())
             self.players[self.dealer].hand.append(self.wall.pop())
@@ -208,7 +300,7 @@ class Room:
         return any(x.get('action')==action and x.get('tile')==tile for x in self.players[seat].pass_locks)
     def draw(self,seat):
         if not self.wall:self.dealer=(self.dealer+1)%4; self.dealer_streak=0; self.end_round('牌墙摸完，流局。'); return False
-        self.clean_locks_for(seat); self.players[seat].hand.append(self.wall.pop()); self.players[seat].hand.sort(); self.current=seat; self.must_discard=True; self.turn_at=time.time(); return True
+        self.clean_locks_for(seat); t=self.wall.pop(); self.players[seat].hand.append(t); self.players[seat].hand.sort(); self.current=seat; self.must_discard=True; self.turn_at=time.time(); self.last_draw_tile=t; self.last_draw_was_gang=self.pending_gang_draw; self.pending_gang_draw=False; self.turn_index+=1; return True
     def ai_pick(self,p):
         pool=[t for t in p.hand if t!=self.dragon and t!=p.forbidden_discard] or [t for t in p.hand if t!=self.dragon] or p.hand[:]
         c=counts(p.hand); pool.sort(key=lambda t:(c[t],random.random())); return pool[0]
@@ -226,7 +318,7 @@ class Room:
         p=self.players[seat]
         if p.forbidden_discard==t:
             self.add_log(f'{p.name} 碰牌后本圈不能立刻打出 {TILE_NAMES[t]}。'); return False
-        p.hand.remove(t); p.discards.append(t); p.forbidden_discard=None; self.last_discard=t; self.last_discarder=seat; self.must_discard=False; self.turn_at=time.time(); self.add_log(f'{p.name} 打出 {TILE_NAMES[t]}。')
+        p.hand.remove(t); p.discards.append(t); p.forbidden_discard=None; self.last_discard=t; self.last_discarder=seat; self.must_discard=False; self.turn_at=time.time(); self.first_discard_done=True; self.add_log(f'{p.name} 打出 {TILE_NAMES[t]}。')
         self.open_claim_window(seat,t); return True
     def open_claim_window(self,discarder,tile):
         opts={}; self.circle_id+=1
@@ -283,7 +375,7 @@ class Room:
     def claim_hu(self,seat):
         with self.lock:
             if not self.claim or 'hu' not in self.claim['options'].get(seat,{}):return
-            tile=self.claim['tile']; discarder=self.claim['discarder']; types=self.claim['options'][seat]['hu']; self.players[seat].hand.append(tile); self.players[seat].hand.sort(); self.remove_claimed_discard(); self.claim=None; self.finish_win(seat,discarder,types)
+            tile=self.claim['tile']; discarder=self.claim['discarder']; types=self.claim['options'][seat]['hu']; before=list(self.players[seat].hand); self.players[seat].hand.append(tile); self.players[seat].hand.sort(); self.remove_claimed_discard(); self.claim=None; self.finish_win(seat,discarder,types,before_hand=before,winning_tile=tile,win_method='discard_win')
     def claim_peng(self,seat):
         with self.lock:
             if not self.claim or not self.claim['options'].get(seat,{}).get('peng'):return
@@ -302,7 +394,7 @@ class Room:
             if not self.claim or not self.claim['options'].get(seat,{}).get('gang'):return
             tile=self.claim['tile']; p=self.players[seat]
             for _ in range(3):p.hand.remove(tile)
-            p.melds.append({'type':'gang','tile':tile,'from':self.claim['discarder'],'concealed':False}); self.remove_claimed_discard(); d=self.claim['discarder']; self.claim=None; self.settle_gang_score(seat,[d],BASE_SCORE*20,'直杠'); self.current=seat; self.must_discard=False
+            p.melds.append({'type':'gang','tile':tile,'from':self.claim['discarder'],'concealed':False}); self.remove_claimed_discard(); d=self.claim['discarder']; self.claim=None; self.settle_gang_score(seat,[d],BASE_SCORE*20,'直杠'); self.current=seat; self.must_discard=False; self.pending_gang_draw=True
             if self.draw(seat): self.add_log(f'{p.name} 杠后补牌。')
         self.ai_until_human()
     def gang(self,seat):
@@ -312,11 +404,11 @@ class Room:
             for tile,n in enumerate(c):
                 if n>=4:
                     for _ in range(4):p.hand.remove(tile)
-                    p.melds.append({'type':'gang','tile':tile,'from':seat,'concealed':True}); self.settle_gang_score(seat,[i for i in range(4) if i!=seat],BASE_SCORE*20,'暗杠'); self.must_discard=False; self.draw(seat); break
+                    p.melds.append({'type':'gang','tile':tile,'from':seat,'concealed':True}); self.settle_gang_score(seat,[i for i in range(4) if i!=seat],BASE_SCORE*20,'暗杠'); self.must_discard=False; self.pending_gang_draw=True; self.draw(seat); break
             else:
                 for m in p.melds:
                     if m.get('type')=='peng' and c[m['tile']]>=1:
-                        tile=m['tile']; p.hand.remove(tile); m['type']='gang'; m['added']=True; self.settle_gang_score(seat,[i for i in range(4) if i!=seat],BASE_SCORE*10,'加杠'); self.must_discard=False; self.draw(seat); break
+                        tile=m['tile']; p.hand.remove(tile); m['type']='gang'; m['added']=True; self.settle_gang_score(seat,[i for i in range(4) if i!=seat],BASE_SCORE*10,'加杠'); self.must_discard=False; self.pending_gang_draw=True; self.draw(seat); break
         self.ai_until_human()
     def hu(self,seat):
         with self.lock:
@@ -324,22 +416,36 @@ class Room:
                 self.claim_hu(seat); return
             if self.phase=='playing' and self.current==seat and self.must_discard:
                 types=win_types(self.players[seat].hand,self.dragon,self.players[seat].melds)
-                if types:self.finish_win(seat,None,types)
+                if types:self.finish_win(seat,None,types,before_hand=tile_without_one(self.players[seat].hand,self.last_draw_tile),winning_tile=self.last_draw_tile,win_method=('gang_draw' if self.last_draw_was_gang else 'self_draw'))
                 else:self.add_log(f'{self.players[seat].name} 现在不能胡。')
-    def dragon_units(self,w): return max(1,sum(1 for t in self.players[w].hand if t==self.dragon)+self.dealer_streak*10)
-    def finish_win(self,w,discarder=None,types=None):
-        types=types or win_types(self.players[w].hand,self.dragon,self.players[w].melds); units=self.dragon_units(w)*BASE_SCORE
+    def build_win_context(self,w,discarder,types,before_hand,winning_tile,win_method):
+        return WinContext(winner=w,win_method=win_method,winning_tile=winning_tile,discarder=discarder,before_win_hand=list(before_hand or []),after_win_hand=list(self.players[w].hand),melds=[dict(m) for m in self.players[w].melds],win_types=list(types or []),wild=self.dragon,is_dealer=(w==self.dealer),dealer_streak=self.dealer_streak,wall_remaining=len(self.wall),turn_index=self.turn_index,first_discard_done=self.first_discard_done)
+    def finish_win(self,w,discarder=None,types=None,before_hand=None,winning_tile=None,win_method=None):
+        types=types or win_types(self.players[w].hand,self.dragon,self.players[w].melds)
+        win_method=win_method or ('discard_win' if discarder is not None else ('gang_draw' if self.last_draw_was_gang else 'self_draw'))
+        if before_hand is None:before_hand=tile_without_one(self.players[w].hand,winning_tile)
+        ctx=self.build_win_context(w,discarder,types,before_hand,winning_tile,win_method)
+        scoring=score_dragon_patterns(ctx); units=scoring['dragons']*BASE_SCORE; total=0; details=[]
         if discarder is None:
             for i in range(4):
-                if i!=w:self.players[i].score-=units; self.players[w].score+=units; self.players[i].lastScoreText=f'-{units} 自摸'; self.players[w].lastScoreText=f'+{units*3} 自摸'
-            msg=f'{self.players[w].name} 自摸胡（{"、".join(types)}），三家各付 {units} 分。'
+                if i!=w:
+                    self.players[i].score-=units; total+=units; self.players[i].lastScoreText=f'-{units} {scoring["dragons"]}龙'
+            self.players[w].score+=total; self.players[w].lastScoreText=f'+{total} {scoring["dragons"]}龙'
+            pay_text=f'自摸/平搓，三家各付 {units} 分'
+        elif scoring['full_payout']:
+            total=units*3; self.players[discarder].score-=total; self.players[discarder].lastScoreText=f'-{total} 冲击全缴'; self.players[w].score+=total; self.players[w].lastScoreText=f'+{total} 冲击全缴'
+            pay_text=f'冲击全缴，{self.players[discarder].name} 独付 {total} 分'
         else:
-            half=math.ceil(units*0.5); total=0
+            half=math.ceil(units*0.5)
             for i in range(4):
                 if i==w:continue
                 pay=units if i==discarder else half
-                self.players[i].score-=pay; total+=pay; self.players[i].lastScoreText=f'-{pay} 点炮胡'
-            self.players[w].score+=total; self.players[w].lastScoreText=f'+{total} 点炮胡'; msg=f'{self.players[w].name} 点炮胡（{"、".join(types)}），{self.players[discarder].name}付 {units} 分，其他家各付 {half} 分。'
+                self.players[i].score-=pay; total+=pay; self.players[i].lastScoreText=f'-{pay} 点炮胡'; details.append(f'{self.players[i].name}-{pay}')
+            self.players[w].score+=total; self.players[w].lastScoreText=f'+{total} 点炮胡'
+            pay_text=f'点炮，{self.players[discarder].name}付 {units} 分，其他家各付 {half} 分'
+        method_text={'self_draw':'自摸','discard_win':'点炮','gang_draw':'杠爆','robbed_kong':'拉杠胡'}.get(win_method,win_method)
+        msg=f'{self.players[w].name} {method_text}胡 {scoring["dragons"]}龙（{"、".join(scoring["patterns"])}），{pay_text}。'
+        self.lastWinSummary={'winner':self.players[w].name,'winnerSeat':w,'method':method_text,'dragons':scoring['dragons'],'patterns':scoring['patterns'],'fullPayout':scoring['full_payout'],'payText':pay_text,'scoreDelta':total}
         if w==self.dealer:self.dealer_streak+=1
         else:self.dealer=(self.dealer+1)%4; self.dealer_streak=0
         self.end_round(msg)
@@ -366,7 +472,7 @@ class Room:
             elif self.phase=='playing' and self.current==seat and self.must_discard:
                 win_list=win_types(p.hand,self.dragon,p.melds); can_hu=bool(win_list); c=counts(p.hand); can_gang=any(v>=4 for v in c) or any(m.get('type')=='peng' and c[m['tile']] for m in p.melds)
             rem=max(0,TURN_SECONDS-int(time.time()-self.turn_at)) if self.phase=='playing' and not self.claim and self.players[self.current].human else TURN_SECONDS
-            return {'room':self.room_id,'phase':self.phase,'ownerSeat':self.owner,'seat':seat,'name':p.name,'current':self.players[self.current].name,'currentSeat':self.current,'wall':len(self.wall),'dragon':TILE_NAMES[self.dragon] if self.phase=='playing' else '未开局','dragonId':self.dragon,'dragonIndicator':(tile_obj(self.dragon_indicator) if self.dragon_indicator is not None else None),'remaining':rem,'claimDeadline':claim_deadline,'claimTile':claim_tile,'canStart':self.phase=='lobby' and seat==self.owner and self.all_ready(),'canReady':self.phase=='lobby' and p.human,'ready':p.ready,'canAct':self.phase=='playing' and not self.claim and self.current==seat and self.must_discard,'canHu':can_hu,'canPeng':can_peng,'canGang':can_gang,'winTypes':win_list,'lastDiscard':(tile_obj(self.last_discard) if self.last_discard is not None else None),'lastDiscarder':self.last_discarder,'lastDiscarderName':(self.players[self.last_discarder].name if self.last_discarder is not None else ''),'hand':[tile_obj(t) for t in p.hand],'melds':self.public_melds(p),'players':[{'seat':i,'name':q.name,'human':q.human,'ready':q.ready,'owner':i==self.owner,'score':q.score,'lastScoreText':q.lastScoreText,'handCount':len(q.hand),'kongCount':sum(1 for m in q.melds if m.get('type')=='gang'),'melds':self.public_melds(q),'discards':[tile_obj(t) for t in q.discards[-28:]]} for i,q in enumerate(self.players)],'log':self.log[-18:]}
+            return {'room':self.room_id,'phase':self.phase,'ownerSeat':self.owner,'seat':seat,'name':p.name,'current':self.players[self.current].name,'currentSeat':self.current,'wall':len(self.wall),'dragon':TILE_NAMES[self.dragon] if self.phase=='playing' else '未开局','dragonId':self.dragon,'dragonIndicator':(tile_obj(self.dragon_indicator) if self.dragon_indicator is not None else None),'remaining':rem,'claimDeadline':claim_deadline,'claimTile':claim_tile,'lastWinSummary':self.lastWinSummary,'canStart':self.phase=='lobby' and seat==self.owner and self.all_ready(),'canReady':self.phase=='lobby' and p.human,'ready':p.ready,'canAct':self.phase=='playing' and not self.claim and self.current==seat and self.must_discard,'canHu':can_hu,'canPeng':can_peng,'canGang':can_gang,'winTypes':win_list,'lastDiscard':(tile_obj(self.last_discard) if self.last_discard is not None else None),'lastDiscarder':self.last_discarder,'lastDiscarderName':(self.players[self.last_discarder].name if self.last_discarder is not None else ''),'hand':[tile_obj(t) for t in p.hand],'melds':self.public_melds(p),'players':[{'seat':i,'name':q.name,'human':q.human,'ready':q.ready,'owner':i==self.owner,'score':q.score,'lastScoreText':q.lastScoreText,'handCount':len(q.hand),'kongCount':sum(1 for m in q.melds if m.get('type')=='gang'),'melds':self.public_melds(q),'discards':[tile_obj(t) for t in q.discards[-28:]]} for i,q in enumerate(self.players)],'log':self.log[-18:]}
 ROOMS={}; LOCK=threading.RLock()
 def get_room(rid=None):
     with LOCK:
