@@ -117,6 +117,44 @@ class XiaziRulesTest(unittest.TestCase):
         self.assertEqual(r.players[1].score, -300)
         self.assertEqual(r.players[2].score, 0)
 
+    def test_round_reveal_keeps_all_hands_after_end_round(self):
+        r = m.Room("REVEAL")
+        r.phase = "playing"
+        r.dragon = 33
+        r.dragon_indicator = 32
+        r.turn_index = 5
+        r.first_discard_done = True
+        r.wall = list(range(20))
+        r.players[0].name = "Winner"
+        r.players[1].name = "Discarder"
+        r.players[0].hand = [0, 0, 0, 1, 2, 3, 9, 10, 11, 18, 19, 33, 33, 20]
+        r.players[1].hand = [1, 1, 1]
+        r.players[2].hand = [2, 2, 2]
+        r.players[3].hand = [3, 3, 3]
+        r.players[1].discards = [20]
+        r.finish_win(0, 1, m.win_types(r.players[0].hand, 33, []), before_hand=r.players[0].hand[:-1], winning_tile=20, win_method="discard_win")
+        self.assertEqual(r.phase, "lobby")
+        self.assertEqual(r.players[0].hand, [])
+        self.assertIsNotNone(r.roundReveal)
+        self.assertEqual(r.roundReveal["winner"], "Winner")
+        self.assertEqual(r.roundReveal["discarderName"], "Discarder")
+        self.assertEqual(len(r.roundReveal["players"][0]["hand"]), 14)
+        self.assertEqual(r.roundReveal["players"][1]["discards"][0]["name"], m.TILE_NAMES[20])
+        self.assertTrue(r.roundReveal["baseTypes"])
+        self.assertTrue(r.roundReveal["patterns"])
+
+    def test_start_clears_previous_round_reveal(self):
+        r = m.Room("REVEAL2")
+        r.roundReveal = {"winner": "old"}
+        r.lastWinSummary = {"winner": "old"}
+        r.owner = 0
+        r.players[0].human = True
+        r.players[0].token = "token"
+        r.players[0].ready = True
+        r.start(0)
+        self.assertIsNone(r.roundReveal)
+        self.assertIsNone(r.lastWinSummary)
+
 
 if __name__ == "__main__":
     unittest.main()
